@@ -113,6 +113,17 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
         cand_flat = candidate_scores.reshape(num_reqs, -1)
         top_ids_flat = cand_ids.reshape(num_reqs, -1)
         parent_flat = state.frontier.repeat_interleave(k, dim=-1)
+
+        # TreeSpark semantics: keep every width*k candidate in the pool and
+        # prune once globally in _select_nodes. The beam cut below only picks
+        # the next depth's frontier, so the pool never collapses to a beam.
+        n_add = num_candidates
+        start = state.num_nodes + 1
+        state.tokens[:, state.num_nodes : state.num_nodes + n_add] = top_ids_flat
+        state.depths[:, state.num_nodes : state.num_nodes + n_add] = child_depth
+        state.parents[:, start : start + n_add] = parent_flat
+        state.path_scores[:, start : start + n_add] = cand_flat
+
         selected = cand_flat.topk(min(k, num_candidates), dim=-1).indices
         if self.keep_greedy:
             present = (selected == ctx.greedy_candidate[:, None]).any(-1)
@@ -124,18 +135,8 @@ class BeamTreeBuilder(TreeBuilder[BeamScoreContext]):
             ).long().argmax(-1)
 
         sel_tokens = torch.gather(top_ids_flat, 1, selected)
-        sel_scores = torch.gather(cand_flat, 1, selected)
-        sel_parents = torch.gather(parent_flat, 1, selected)
-        n_add = selected.shape[1]
-        start = state.num_nodes + 1
-        state.tokens[:, state.num_nodes : state.num_nodes + n_add] = sel_tokens
-        state.depths[:, state.num_nodes : state.num_nodes + n_add] = child_depth
-        state.parents[:, start : start + n_add] = sel_parents
-        state.path_scores[:, start : start + n_add] = sel_scores
         ctx.frontier_tokens = sel_tokens
-        frontier = self._node_arange[start : start + n_add].unsqueeze(0).expand(
-            num_reqs, -1
-        )
+        frontier = start + selected
         if self.keep_greedy:
             ctx.greedy_pools.append(frontier[ctx.req_ids, ctx.greedy_frontier])
         return frontier, n_add

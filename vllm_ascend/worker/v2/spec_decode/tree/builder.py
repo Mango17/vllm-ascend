@@ -86,7 +86,9 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
         """Return the backend's frontier width."""
 
     def _pool_capacity(self, width: int, spec_num: int) -> int:
-        return width * spec_num
+        # TreeSpark keeps every width*k candidate in the pool and prunes once
+        # globally: width candidates at depth 0, width*width per later depth.
+        return width + width * width * (spec_num - 1)
 
     def _ensure_scratch(
         self,
