@@ -109,6 +109,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_TREE_KEEP_GREEDY": lambda: bool(
         int(os.getenv("VLLM_ASCEND_TREE_KEEP_GREEDY", "0"))
     ),
+    # Emit sampled tree-build and verification diagnostics. Default False;
+    # valid values are 0 (disabled) and 1 (enabled).
+    "VLLM_ASCEND_TREE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_TREE_DEBUG", "0"))
+    ),
 }
 
 # end-env-vars-definition

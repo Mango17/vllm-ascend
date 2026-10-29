@@ -3,6 +3,7 @@ import torch
 from tests.ut.base import TestBase
 from vllm_ascend.worker.v2.spec_decode.tree.beam import BeamTreeBuilder
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
+from vllm_ascend.worker.v2.spec_decode.tree.reference import build_reference_tree
 from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
     greedy_tree_reject_torch,
 )
@@ -88,6 +89,58 @@ class TestBeamTreeBuilder(TestBase):
                     hidden[0, depth].expand(hidden_states.shape[0], -1),
                 )
             )
+
+    def test_builder_matches_reference_candidate_policy(self):
+        class IdentityMarkovModel:
+            def markov_init_state(self, batch_size):
+                return torch.zeros((batch_size, 2), dtype=torch.float32)
+
+            def markov_step(self, state, token_ids, hidden_states):
+                bias = torch.zeros((token_ids.shape[0], 8), dtype=torch.float32)
+                bias[torch.arange(token_ids.shape[0]), token_ids % 8] = 3.0
+                return state, bias
+
+            def map_draft_to_target(self, token_ids):
+                return token_ids
+
+        model = IdentityMarkovModel()
+        logits = torch.tensor(
+            [
+                [
+                    [4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0],
+                    [3.5, 3.0, 2.5, 2.0, 1.5, 1.0, 0.5, 0.0],
+                    [3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0],
+                ]
+            ]
+        )
+        hidden = torch.zeros((1, 3, 4), dtype=torch.float32)
+        root = torch.tensor([1])
+        builder = BeamTreeBuilder(budget=6, topk=2, draft_model=model)
+        actual = builder.build(
+            logits,
+            _layout(6),
+            root_token_ids=root,
+            draft_hidden=hidden,
+            graph_safe=True,
+        )
+        expected_tokens, expected_parents, expected_depths = build_reference_tree(
+            model,
+            draft_logits=logits,
+            draft_hidden=hidden,
+            root_token_ids=root,
+            top_k=2,
+            max_nodes=6,
+        )
+
+        self.assertTrue(
+            torch.equal(actual.tokens[0, :6], expected_tokens)
+        )
+        self.assertTrue(
+            torch.equal(actual.parents[0, :6], expected_parents)
+        )
+        self.assertTrue(
+            torch.equal(actual.depths[0, :6], expected_depths)
+        )
 
 
 class TestGreedyTreeRejection(TestBase):

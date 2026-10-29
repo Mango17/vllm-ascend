@@ -1837,6 +1837,14 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         if tree_bsnd is not None:
             k, q_len = tree_bsnd
+            logger.info_once(
+                "MLA target tree verification active: num_tokens=%d "
+                "num_reqs=%d q_len=%d mask=%s",
+                num_tokens,
+                k,
+                q_len,
+                tuple(decode_meta.attn_mask.shape),
+            )
             fia_q_nope = q_nope[: k * q_len].view(k, q_len, self.num_heads, -1).contiguous()
             fia_q_pe = q_pe[: k * q_len].view(k, q_len, self.num_heads, -1)
             if self.head_padding > 0:

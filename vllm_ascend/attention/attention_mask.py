@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
+from vllm.logger import init_logger
 
+from vllm_ascend import envs
 from vllm_ascend.attention.tree_spec import (
     dummy_tree_mask_for_capture,
     dummy_tree_visibility,
@@ -25,6 +27,8 @@ from vllm_ascend.attention.tree_spec import (
 )
 from vllm_ascend.platform import ModelConfig
 from vllm_ascend.utils import singleton
+
+logger = init_logger("vllm.tree_spec.mask")
 
 
 def _generate_attn_mask(max_seq_len, dtype):
@@ -106,6 +110,7 @@ class AttentionMaskBuilder:
         # Contiguous [B, Q, KV] for FIA BSND + sparse_mode=0. Capture weak-refs
         # this buffer; do not return a temporary cat/contiguous tensor.
         self._tree_fia_bsnd: torch.Tensor | None = None
+        self._tree_debug_calls = 0
 
     def configure_tree_mask(
         self, max_num_decode: int, query_len: int, kv_len: int
@@ -242,6 +247,14 @@ class AttentionMaskBuilder:
                 # Dummy FULL gears that are not k × (1+budget) must keep the
                 # 2D splitfuse mask. TND + sparse 3 rejects a 4D tree mask.
                 if for_capture and not tree_shaped:
+                    if envs.VLLM_ASCEND_TREE_DEBUG:
+                        logger.warning(
+                            "Tree capture is using the splitfuse fallback: "
+                            "num_tokens=%d num_decode=%d, expected tree query=%s",
+                            num_tokens,
+                            num_decode,
+                            tree_query_len(),
+                        )
                     return self.get_splitfuse_attn_mask()
                 return self.get_tree_attention_mask(
                     tree_visibility, seq_lens, num_decode
@@ -316,6 +329,7 @@ class AttentionMaskBuilder:
                 if num_decode > num_mask:
                     attn_mask[num_mask:].fill_(True)
                 self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
+                self._log_tree_mask(attn_mask, tree_visibility, seq_lens, query_len)
                 return attn_mask
             attn_mask.fill_(True)
             for i in range(num_mask):
@@ -328,7 +342,45 @@ class AttentionMaskBuilder:
                 draft_start = prev_kv_len + 1
                 req_mask[1:, draft_start : draft_start + max_nodes] = ~tree_visibility[i]
             self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
+            self._log_tree_mask(attn_mask, tree_visibility, seq_lens, query_len)
             return attn_mask
+
+    def _log_tree_mask(
+        self,
+        attn_mask: torch.Tensor,
+        tree_visibility: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_len: int,
+    ) -> None:
+        if not envs.VLLM_ASCEND_TREE_DEBUG:
+            return
+        self._tree_debug_calls += 1
+        if (
+            self._tree_debug_calls > 5
+            and self._tree_debug_calls % 100 != 0
+        ):
+            return
+        visible_counts = (~attn_mask[0, 0]).sum(dim=-1)[:8].cpu().tolist()
+        draft_count = min(8, query_len - 1, tree_visibility.shape[-1])
+        draft_start = int(seq_lens[0]) - query_len + 1
+        expected = tree_visibility[0, :draft_count, :draft_count].bool()
+        actual = ~attn_mask[
+            0,
+            0,
+            1 : draft_count + 1,
+            draft_start : draft_start + draft_count,
+        ]
+        mismatch = int((actual != expected).sum().item())
+        logger.info(
+            "[TREEDSPARK][mask] call=%d shape=%s "
+            "first_visible_per_query=%s draft_start=%d "
+            "first_rows_mismatch=%d",
+            self._tree_debug_calls,
+            tuple(attn_mask.shape),
+            visible_counts,
+            draft_start,
+            mismatch,
+        )
 
     def get_final_mla_mask(self, model_config: ModelConfig):
         # Prefill stages use 512x512 mask with appropriate dtype

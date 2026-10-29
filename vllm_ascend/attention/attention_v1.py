@@ -24,6 +24,7 @@ import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
     AttentionBackend,
@@ -1753,6 +1754,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         use_bsnd = block_table is not None and bsnd is not None
         if use_bsnd:
             num_decodes, q_len = bsnd
+            logger.info_once(
+                "GQA target tree verification active: num_tokens=%d "
+                "num_reqs=%d q_len=%d",
+                num_tokens,
+                num_decodes,
+                q_len,
+            )
             fia_query = query[: num_decodes * q_len].view(
                 num_decodes, q_len, self.num_heads, self.head_size
             )

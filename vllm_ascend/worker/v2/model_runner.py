@@ -59,6 +59,10 @@ from vllm_ascend.worker.v2.spec_decode import (
     init_speculator,
     tree_target_query_len,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.diagnostics import (
+    should_log_tree_debug,
+    tree_debug_enabled,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
@@ -87,6 +91,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.update_stream = None
         self.tree_kv_compact = None
+        self._tree_input_debug_calls = 0
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -345,6 +350,27 @@ class NPUModelRunner(GPUModelRunner):
             and self.ascend_config.tree_spec_config.topk > 1
         )
         if use_tree_pos:
+            if tree_debug_enabled():
+                self._tree_input_debug_calls += 1
+                if should_log_tree_debug(self._tree_input_debug_calls):
+                    first_tree_tokens = min(num_tokens, 9)
+                    logger.info(
+                        "Tree target inputs active: call=%d num_reqs=%d "
+                        "num_tokens=%d tree_depth_width=%d positions=%s "
+                        "slot_positions=%s",
+                        self._tree_input_debug_calls,
+                        num_reqs,
+                        num_tokens_after_padding,
+                        tree_depths.shape[-1],
+                        self.input_buffers.positions[:first_tree_tokens]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        self.input_buffers.slot_positions[:first_tree_tokens]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                    )
             is_prefilling = async_copy_to_gpu(
                 torch.from_numpy(is_prefilling_np),
                 device=self.device,

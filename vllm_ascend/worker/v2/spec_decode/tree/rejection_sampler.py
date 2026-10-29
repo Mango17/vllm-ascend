@@ -6,6 +6,11 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.worker.v2.spec_decode.tree.diagnostics import (
+    log_tree_debug,
+    should_log_tree_debug,
+    tree_debug_enabled,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 _PAD_TOKEN_ID = -1
@@ -224,6 +229,7 @@ class TreeRejectionSampler(RejectionSampler):
         self._buf_cap_reqs = 0
         self._buf_cap_vocab = 0
         self._buf_cap_nodes = 0
+        self._debug_verification_calls = 0
 
     def _ensure_bufs(self, num_reqs: int, node_dim: int, vocab: int) -> None:
         device = self.device
@@ -279,8 +285,18 @@ class TreeRejectionSampler(RejectionSampler):
         num_reqs = input_batch.num_reqs
         node_dim = tree.tokens.shape[1] + 1
         self._ensure_bufs(num_reqs, node_dim, logits.shape[-1])
-        target_logits = _pack_tree_target_logits(
+        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+        positions = input_batch.positions[input_batch.logits_indices]
+        processed_logits = self.sampler.apply_sampling_params(
             logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping_np,
+            positions,
+            draft_sampled,
+            input_batch.expanded_local_pos,
+        )
+        target_logits = _pack_tree_target_logits(
+            processed_logits,
             input_batch.cu_num_logits_np,
             num_reqs,
             node_dim,
@@ -300,6 +316,29 @@ class TreeRejectionSampler(RejectionSampler):
                 sampled_token_ids=sampled_buf,
             )
         num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
+        if tree_debug_enabled():
+            self._debug_verification_calls += 1
+            if should_log_tree_debug(self._debug_verification_calls):
+                node_counts = tree.num_nodes[:num_reqs].detach().cpu().tolist()
+                accepted = num_sampled.detach().cpu().tolist()
+                first_path = path_node_ids[0].detach().cpu().tolist()
+                logits_per_req = (
+                    input_batch.cu_num_logits_np[1 : num_reqs + 1]
+                    - input_batch.cu_num_logits_np[:num_reqs]
+                ).tolist()
+                log_tree_debug(
+                    "[TREEDSPARK][verify] call=%d reqs=%d nodes=%s "
+                    "target_logits_per_req=%s "
+                    "sampled_including_bonus=%s avg_accept_len=%.3f "
+                    "first_path=%s",
+                    self._debug_verification_calls,
+                    num_reqs,
+                    node_counts,
+                    logits_per_req,
+                    accepted,
+                    sum(accepted) / max(len(accepted), 1),
+                    first_path,
+                )
         cu = input_batch.cu_num_logits[: num_reqs + 1]
         num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
         is_chunked = (

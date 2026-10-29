@@ -215,6 +215,12 @@ def _prepare_dflash_inputs_kernel_ascend(
         ctx_block_id = tl.load(block_table_ptr + req_idx * block_table_stride + ctx_block_num).to(tl.int64)
         ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
         tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos)
+        # Only the committed root + accepted path are valid context rows.
+        # Packed-tree siblings share RoPE positions, so writing rejected rows
+        # would target the same draft-KV slots as an accepted path row and
+        # overwrite its freshly compacted hidden state. PAD those slots; the
+        # draft KV update ignores PAD_SLOT_ID.
+        ctx_slot = tl.where(ctx_pos_idx < valid_ctx_end, ctx_slot, PAD_SLOT_ID)
         tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot)
 
     # --- Query positions / input_ids / slots ---

@@ -16,6 +16,11 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
 from vllm_ascend.worker.v2.spec_decode.tree.builder import (
     create_tree_builder,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.diagnostics import (
+    log_tree_debug,
+    should_log_tree_debug,
+    tree_debug_enabled,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_query_along_path,
     compact_tree_query_along_path_eager,
@@ -138,6 +143,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._domino_scorer = None
         self._domino_prefix_len = 0
         self._tree_finalized = True
+        self._debug_build_calls = 0
+        self._debug_reference_builds = 0
+        self._debug_context_calls = 0
         self.tree_kv_compact = None
         dflash_cfg = _hf_dflash_config(draft_hf)
         self._domino_shift_label = (
@@ -256,10 +264,14 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             device=device,
         )
         self.tree = self._load_layout_from_buffers(self.max_num_reqs)
+        target_hf = vllm_config.model_config.hf_config
+        target_arch = tuple(getattr(target_hf, "architectures", None) or ())
+        draft_arch = tuple(getattr(draft_hf, "architectures", None) or ())
         logger.info(
             "Tree speculator enabled: method=%s budget=%s topk=%s "
             "depth=%s sample_from_anchor=%s num_query_per_req=%s "
-            "draft_backend=%s domino_shift_label=%s",
+            "draft_backend=%s domino_shift_label=%s target_arch=%s "
+            "draft_arch=%s",
             self.method,
             self.budget,
             self.topk,
@@ -268,6 +280,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self.num_query_per_req,
             self.draft_backend,
             self._domino_shift_label,
+            target_arch,
+            draft_arch,
         )
         from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
         from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
@@ -503,14 +517,48 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             prefix_len=self._domino_prefix_len,
             params=self.params,
         )
+        markov_head = getattr(getattr(model, "model", model), "markov_head", None)
+        markov_type = getattr(markov_head, "head_type", None)
+        draft_hf = self.draft_model_config.hf_config
+        tree_training_anchors = getattr(draft_hf, "tree_loss_num_anchors", None)
+        tree_training_topk = getattr(draft_hf, "tree_loss_top_k", None)
+        tree_training_nodes = getattr(draft_hf, "tree_loss_max_nodes", None)
         logger.info(
-            "Tree correction heads: markov=%s domino=%s prefix_len=%s "
-            "shift_label=%s",
+            "Tree correction heads: markov=%s markov_type=%s draft_vocab=%s "
+            "target_vocab=%s checkpoint_tree=(anchors=%s, topk=%s, nodes=%s) "
+            "domino=%s prefix_len=%s shift_label=%s",
             draft_model is not None,
+            markov_type,
+            int(getattr(getattr(model, "config", None), "draft_vocab_size", 0) or 0),
+            int(getattr(getattr(model, "config", None), "vocab_size", 0) or 0),
+            tree_training_anchors,
+            tree_training_topk,
+            tree_training_nodes,
             self._domino_scorer is not None,
             self._domino_prefix_len,
             self._domino_shift_label,
         )
+        if tree_training_anchors == 0:
+            logger.warning(
+                "DSpark checkpoint has tree_loss_num_anchors=0; it was not "
+                "trained with TreeSpark objectives. Tree inference may "
+                "underperform the greedy DSpark chain."
+            )
+        elif (
+            tree_training_topk is not None
+            and int(tree_training_topk) != self.topk
+        ) or (
+            tree_training_nodes is not None
+            and int(tree_training_nodes) != self.budget
+        ):
+            logger.warning(
+                "Tree inference policy differs from checkpoint training policy: "
+                "checkpoint(topk=%s, nodes=%s), runtime(topk=%s, nodes=%s)",
+                tree_training_topk,
+                tree_training_nodes,
+                self.topk,
+                self.budget,
+            )
 
     def _align_dspark_copy_buffer(self, width: int) -> None:
         """DFlash.propose copy_ dest must match combine(aux) / last_hidden."""
@@ -802,6 +850,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                                 path_node_ids,
                                 linearize_positions=input_batch.positions,
                             )
+                self._log_rejected_context_slots(
+                    input_batch, num_sampled, num_rejected
+                )
             self._tree_finalized = False
             # DSV4's HC inputs need width alignment. Qwen's combine_hidden_states
             # already projects target features to the fixed draft hidden width;
@@ -895,6 +946,43 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             return tokens
         finally:
             self._dsv4_chunk_prefix_len = None
+
+    def _log_rejected_context_slots(
+        self,
+        input_batch,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        """Report packed-tree rows that must not write draft context KV."""
+        if not tree_debug_enabled():
+            return
+        self._debug_context_calls += 1
+        if not should_log_tree_debug(self._debug_context_calls):
+            return
+
+        num_reqs = input_batch.num_reqs
+        qsl = input_batch.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
+        positions = input_batch.positions.detach().cpu().tolist()
+        sampled = num_sampled[:num_reqs].detach().cpu().tolist()
+        rejected = num_rejected[:num_reqs].detach().cpu().tolist()
+        collision_positions = []
+        for req in range(num_reqs):
+            start, end = int(qsl[req]), int(qsl[req + 1])
+            valid_end = start + int(sampled[req])
+            valid = set(positions[start:valid_end])
+            collision_positions.append(
+                sum(int(position) in valid for position in positions[valid_end:end])
+            )
+        log_tree_debug(
+            "[TREEDSPARK][context-kv] call=%d reqs=%d sampled=%s rejected=%s "
+            "collision_positions=%s first_positions=%s",
+            self._debug_context_calls,
+            num_reqs,
+            sampled,
+            rejected,
+            collision_positions,
+            positions[: min(int(qsl[-1]), 12)],
+        )
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
@@ -1058,6 +1146,105 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             with tree_time("build_draft_tree"):
                 self._run_tree_finalize(num_reqs, graph_safe=False)
         self._tree_finalized = True
+        self._log_tree_build(num_reqs, graph_replay=graph is not None)
+        self._check_reference_tree(num_reqs)
+
+    def _log_tree_build(self, num_reqs: int, *, graph_replay: bool) -> None:
+        if not tree_debug_enabled():
+            return
+        self._debug_build_calls += 1
+        if not should_log_tree_debug(self._debug_build_calls):
+            return
+
+        node_counts = self.tree.num_nodes[:num_reqs].detach().cpu().tolist()
+        first_count = int(node_counts[0]) if node_counts else 0
+        depths: list[int] = []
+        parents: list[int] = []
+        tokens: list[int] = []
+        if first_count:
+            depths = self.tree.depths[0, :first_count].detach().cpu().tolist()
+            parents = self.tree.parents[0, :first_count].detach().cpu().tolist()
+            tokens = self.tree.tokens[0, :first_count].detach().cpu().tolist()
+        depth_histogram: dict[int, int] = {}
+        for depth in depths:
+            depth_histogram[int(depth)] = depth_histogram.get(int(depth), 0) + 1
+        root_tokens = [
+            token for token, parent in zip(tokens, parents) if int(parent) == 0
+        ]
+        log_tree_debug(
+            "[TREEDSPARK][build] call=%d graph_replay=%s reqs=%d nodes=%s "
+            "first_nodes=%d depth_hist=%s root_children=%s",
+            self._debug_build_calls,
+            graph_replay,
+            num_reqs,
+            node_counts,
+            first_count,
+            depth_histogram,
+            root_tokens,
+        )
+        if tokens:
+            log_tree_debug(
+                "[TREEDSPARK][tree] call=%d tokens=%s parents=%s depths=%s",
+                self._debug_build_calls,
+                tokens,
+                parents,
+                depths,
+            )
+
+    def _check_reference_tree(self, num_reqs: int) -> None:
+        if not tree_debug_enabled() or self.tree_builder is None:
+            return
+        self._debug_reference_builds += 1
+        if self._debug_reference_builds > 5:
+            return
+        actual_nodes = int(self.tree.num_nodes[0])
+        if actual_nodes == 0:
+            return
+
+        from vllm_ascend.worker.v2.spec_decode.tree.reference import (
+            build_reference_tree,
+        )
+
+        num_sample = self.num_speculative_steps
+        sample_hidden_states = self._draft_hidden_buf[
+            self.sample_indices[:num_sample]
+        ]
+        logits = self.model.compute_draft_logits(sample_hidden_states).view(
+            1, num_sample, -1
+        )
+        draft_hidden = sample_hidden_states.view(1, num_sample, -1)
+        num_query = self.num_query_per_req
+        root_token_ids = self.input_buffers.input_ids[
+            :num_query
+        ].view(1, num_query)[:, 0]
+        ref_tokens, ref_parents, ref_depths = build_reference_tree(
+            self.model,
+            draft_logits=logits,
+            draft_hidden=draft_hidden,
+            root_token_ids=root_token_ids,
+            top_k=self.topk,
+            max_nodes=self.budget,
+        )
+
+        count = min(actual_nodes, int(ref_tokens.numel()))
+        actual_tokens = self.tree.tokens[0, :count]
+        actual_parents = self.tree.parents[0, :count]
+        actual_depths = self.tree.depths[0, :count]
+        token_mismatch = int((actual_tokens != ref_tokens[:count]).sum().item())
+        parent_mismatch = int((actual_parents != ref_parents[:count]).sum().item())
+        depth_mismatch = int((actual_depths != ref_depths[:count]).sum().item())
+        log_tree_debug(
+            "[TREEDSPARK][reference] call=%d actual_nodes=%d ref_nodes=%d "
+            "token_mismatch=%d parent_mismatch=%d depth_mismatch=%d "
+            "ref_tokens=%s",
+            self._debug_reference_builds,
+            actual_nodes,
+            int(ref_tokens.numel()),
+            token_mismatch,
+            parent_mismatch,
+            depth_mismatch,
+            ref_tokens.detach().cpu().tolist(),
+        )
 
     def _generate_draft(
         self,

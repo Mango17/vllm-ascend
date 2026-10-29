@@ -4,6 +4,11 @@ from vllm.logger import init_logger
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     iter_unique_kv_cache_tensors,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.diagnostics import (
+    log_tree_debug,
+    should_log_tree_debug,
+    tree_debug_enabled,
+)
 
 logger = init_logger("vllm." + __name__)
 
@@ -90,6 +95,8 @@ class TreeKvCompact:
         )
         self._depth0 = torch.arange(self.spec_len, device=self.device, dtype=torch.int32)
         self._dst_off = self._depth
+        self._debug_compaction_calls = 0
+        self._debug_verify_compaction = False
 
     def capture(self, sizes: list[int]) -> None:
         if not sizes or self.runner.model_config.enforce_eager:
@@ -133,6 +140,22 @@ class TreeKvCompact:
         self._held = None
         self._held_keep = None
         self._bind_groups(num_reqs)
+        if tree_debug_enabled():
+            self._debug_compaction_calls += 1
+            self._debug_verify_compaction = should_log_tree_debug(
+                self._debug_compaction_calls
+            )
+            if self._debug_verify_compaction:
+                log_tree_debug(
+                    "[TREEDSPARK][compact-kv] call=%d reqs=%d groups=%d "
+                    "first_path=%s",
+                    self._debug_compaction_calls,
+                    num_reqs,
+                    len(self._groups or ()),
+                    path_node_ids[0].detach().cpu().tolist(),
+                )
+        else:
+            self._debug_verify_compaction = False
         if self.runner.model_config.enforce_eager:
             self._compact_eager(num_reqs)
             return
@@ -186,6 +209,16 @@ class TreeKvCompact:
         # All gathers precede all writes, including when cache views alias.
         for cache, block, offset, values in transfers:
             cache[block, offset] = values
+        if self._debug_verify_compaction:
+            mismatches = sum(
+                int((cache[block, offset] != values).any().item())
+                for cache, block, offset, values in transfers
+            )
+            log_tree_debug(
+                "[TREEDSPARK][compact-kv-check] call=%d eager_mismatches=%d",
+                self._debug_compaction_calls,
+                mismatches,
+            )
 
     def _bind_groups(self, num_reqs=None) -> None:
         # dspark-ori-binding-fix:v1
@@ -277,6 +310,21 @@ class TreeKvCompact:
                 scratch = gather[:nslot]
                 torch.index_select(flat, 0, src_flat, out=scratch)
                 flat.index_copy_(0, dst_flat, scratch)
+                if self._debug_verify_compaction:
+                    mismatch = int(
+                        (
+                            flat.index_select(0, dst_flat) != scratch
+                        )
+                        .any()
+                        .item()
+                    )
+                    log_tree_debug(
+                        "[TREEDSPARK][compact-kv-check] call=%d "
+                        "graph_mismatch=%d cache_shape=%s",
+                        self._debug_compaction_calls,
+                        mismatch,
+                        tuple(cache.shape),
+                    )
                 if hold:
                     held.append((cache, scratch, dst_keep))
         self._held = held if hold else None

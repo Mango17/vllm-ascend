@@ -64,6 +64,11 @@ def _patch_tree_verify_width(scheduler_cls) -> None:
         finally:
             self.num_spec_tokens = draft_depth
         output.num_spec_tokens_to_schedule = verify_width
+        logger.info_once(
+            "Tree scheduler verify width active: draft_depth=%d verify_width=%d",
+            draft_depth,
+            verify_width,
+        )
         async_placeholder = getattr(self, "_spec_token_placeholders", None)
         if async_placeholder is not None and len(async_placeholder) != verify_width:
             width_placeholder = [-1] * verify_width
@@ -79,17 +84,22 @@ def _patch_tree_verify_width(scheduler_cls) -> None:
 
 
 def _patch_loaded_tree_schedulers() -> None:
-    """Patch every already-loaded class that overrides ``Scheduler.schedule``."""
-    pending = [*Scheduler.__mro__, *Scheduler.__subclasses__()]
+    """Patch loaded scheduler implementations without recursive metatype walks."""
+    scheduler_classes = list(Scheduler.__mro__)
+    try:
+        scheduler_classes.extend(Scheduler.__subclasses__())
+    except TypeError:
+        # Some scheduler modules install callable proxy types during plugin
+        # loading. They are patched explicitly by their own module instead.
+        pass
+
     seen: set[type] = set()
-    while pending:
-        scheduler_cls = pending.pop()
-        if scheduler_cls in seen:
+    for scheduler_cls in scheduler_classes:
+        if not isinstance(scheduler_cls, type) or scheduler_cls in seen:
             continue
         seen.add(scheduler_cls)
-        if "schedule" in scheduler_cls.__dict__:
+        if "schedule" in vars(scheduler_cls):
             _patch_tree_verify_width(scheduler_cls)
-        pending.extend(scheduler_cls.__subclasses__())
 
 
 _patch_loaded_tree_schedulers()
