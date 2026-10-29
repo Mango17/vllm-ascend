@@ -1494,6 +1494,276 @@ class TestAscendMLAImpl(TestBase):
             speculative_config=mock_speculative_config,
         )
 
+    @patch("vllm_ascend.attention.mla_v1.AttentionMaskBuilder")
+    @patch("vllm_ascend.attention.mla_v1.get_graph_params")
+    @patch("torch.npu.stream")
+    @patch("torch.npu.graph_task_update_begin")
+    @patch("torch.npu.graph_task_update_end")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2.out")
+    def test_update_graph_params_with_tree(
+        self,
+        mock_fia,
+        mock_update_end,
+        mock_update_begin,
+        mock_stream,
+        mock_get_graph_params,
+        mock_mask_builder,
+    ):
+        tree_mask = torch.zeros((1, 17, 32), dtype=torch.bool)
+        mock_mask_builder.return_value.as_bsnd_fia_mask.return_value = tree_mask
+
+        decode = SimpleNamespace(
+            attn_mask=torch.zeros((1, 1, 17, 32), dtype=torch.bool),
+            block_table=torch.zeros((1, 2), dtype=torch.int32),
+            seq_lens_list=[31],
+        )
+        metadata = SimpleNamespace(decode=decode)
+        forward_context = SimpleNamespace(
+            attn_metadata={"layer_0": metadata},
+        )
+
+        attn_output = torch.empty((1, 17, 2, 4))
+        softmax_lse = torch.empty(17)
+        param = (
+            torch.empty((1, 17, 2, 2)),
+            torch.empty((2, 2, 4, 4)),
+            torch.empty((1, 17, 2, 2)),
+            torch.empty((2, 2, 4, 2)),
+            2,
+            2,
+            "BSND",
+            tree_mask,
+            0,
+            0.1,
+            decode.block_table,
+            4,
+            [30],
+            [17],
+            attn_output,
+            softmax_lse,
+            None,
+            None,
+            1,
+            None,
+            (1, 17),
+        )
+        graph_params = SimpleNamespace(
+            attn_params={17: [param]},
+            handles={17: [MagicMock()]},
+            events={17: [MagicMock()]},
+            workspaces={17: torch.empty(8)},
+        )
+        mock_get_graph_params.return_value = graph_params
+
+        with patch(
+            "vllm_ascend.attention.mla_v1._EXTRA_CTX",
+            SimpleNamespace(is_draft_model=False),
+        ):
+            AscendMLAImpl.update_graph_params(
+                MagicMock(),
+                forward_context,
+                17,
+            )
+
+        kwargs = mock_fia.call_args.kwargs
+        self.assertEqual(kwargs["input_layout"], "BSND")
+        self.assertEqual(kwargs["sparse_mode"], 0)
+        self.assertEqual(kwargs["actual_seq_qlen"], [17])
+        self.assertEqual(kwargs["actual_seq_kvlen"], [31])
+        mock_update_begin.assert_called_once()
+        mock_update_end.assert_called_once()
+
+    @patch("vllm_ascend.attention.mla_v1.AttentionMaskBuilder")
+    @patch("vllm_ascend.attention.mla_v1.tree_fia_bsnd_shape")
+    @patch("vllm_ascend.attention.mla_v1.tree_spec_enabled")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2")
+    def test_forward_decode_tree_uses_batch_major_projection(
+        self,
+        mock_fia,
+        mock_tree_enabled,
+        mock_tree_shape,
+        mock_mask_builder,
+    ):
+        mock_tree_enabled.return_value = True
+        mock_tree_shape.return_value = (1, 17)
+        mock_mask_builder.return_value.as_bsnd_fia_mask.return_value = (
+            torch.zeros((1, 17, 32), dtype=torch.bool)
+        )
+
+        num_heads = 2
+        kv_heads = 1
+        block_size = 4
+        kv_lora_rank = 4
+        rope_dim = 2
+        q_nope = torch.empty((17, num_heads, 2))
+        q_pe = torch.empty((17, num_heads, rope_dim))
+        k_nope = torch.empty((2, kv_heads, block_size, kv_lora_rank))
+        k_pe = torch.empty((2, kv_heads, block_size, rope_dim))
+        fia_output = torch.empty((1, 17, num_heads, kv_lora_rank))
+        mock_fia.return_value = (fia_output, None)
+
+        decode = SimpleNamespace(
+            attn_mask=torch.zeros((1, 1, 17, 32), dtype=torch.bool),
+            block_table=torch.zeros((1, 2), dtype=torch.int32),
+            seq_lens_list=[31],
+        )
+        metadata = SimpleNamespace(
+            decode=decode,
+            num_decodes=1,
+            num_prefills=0,
+            pending_reject_event=None,
+            reject_finalized=False,
+        )
+
+        self.impl.num_heads = num_heads
+        self.impl.num_heads_padded = num_heads
+        self.impl.head_padding = 0
+        self.impl.num_kv_heads = kv_heads
+        self.impl.kv_lora_rank = kv_lora_rank
+        self.impl.qk_rope_head_dim = rope_dim
+        self.impl.fa_quant_layer = False
+        self.impl.enable_kv_nz = False
+
+        projected = torch.empty((17, num_heads * self.impl.v_head_dim))
+        with (
+            patch(
+                "vllm_ascend.attention.mla_v1._EXTRA_CTX",
+                SimpleNamespace(capturing=False, is_draft_model=False),
+            ),
+            patch.object(
+                self.impl,
+                "_v_up_proj_batch_major",
+                return_value=projected,
+            ) as mock_batch_major,
+        ):
+            result = self.impl._forward_decode(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                block_size,
+                metadata,
+            )
+
+        self.assertIs(result, projected)
+        mock_batch_major.assert_called_once_with(fia_output)
+        self.assertEqual(
+            mock_fia.call_args.kwargs["input_layout"],
+            "BSND",
+        )
+
+    @patch("vllm_ascend.attention.mla_v1.AttentionMaskBuilder")
+    @patch("vllm_ascend.attention.mla_v1.tree_fia_bsnd_shape")
+    @patch("vllm_ascend.attention.mla_v1.tree_spec_enabled")
+    @patch("vllm_ascend.attention.mla_v1.update_graph_params_workspaces")
+    @patch("vllm_ascend.attention.mla_v1.get_graph_params")
+    @patch("torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2.out")
+    @patch("torch.npu.graph_task_group_end")
+    @patch("torch.npu.graph_task_group_begin")
+    @patch("torch.npu.ExternalEvent")
+    def test_forward_decode_tree_capture_registers_graph_task(
+        self,
+        mock_event,
+        mock_graph_begin,
+        mock_graph_end,
+        mock_fia_out,
+        mock_get_max_workspace,
+        mock_get_graph_params,
+        mock_update_workspaces,
+        mock_tree_enabled,
+        mock_tree_shape,
+        mock_mask_builder,
+    ):
+        mock_tree_enabled.return_value = True
+        mock_tree_shape.return_value = (1, 17)
+        tree_mask = torch.zeros((1, 17, 32), dtype=torch.bool)
+        mock_mask_builder.return_value.as_bsnd_fia_mask.return_value = tree_mask
+
+        workspace = torch.empty(8)
+        mock_get_max_workspace.return_value = workspace
+        handle = MagicMock()
+        mock_graph_end.return_value = handle
+        graph_params = SimpleNamespace(
+            attn_params={17: []},
+            handles={17: []},
+            events={17: []},
+            workspaces={17: None},
+        )
+        mock_get_graph_params.return_value = graph_params
+
+        num_heads = 2
+        kv_heads = 1
+        block_size = 4
+        kv_lora_rank = 4
+        rope_dim = 2
+        q_nope = torch.empty((17, num_heads, 2))
+        q_pe = torch.empty((17, num_heads, rope_dim))
+        k_nope = torch.empty((2, kv_heads, block_size, kv_lora_rank))
+        k_pe = torch.empty((2, kv_heads, block_size, rope_dim))
+        decode = SimpleNamespace(
+            attn_mask=torch.zeros((1, 1, 17, 32), dtype=torch.bool),
+            block_table=torch.zeros((1, 2), dtype=torch.int32),
+            seq_lens_list=[31],
+        )
+        metadata = SimpleNamespace(
+            decode=decode,
+            num_decodes=1,
+            num_prefills=0,
+            pending_reject_event=None,
+            reject_finalized=False,
+        )
+
+        self.impl.num_heads = num_heads
+        self.impl.num_heads_padded = num_heads
+        self.impl.head_padding = 0
+        self.impl.num_kv_heads = kv_heads
+        self.impl.kv_lora_rank = kv_lora_rank
+        self.impl.qk_rope_head_dim = rope_dim
+        self.impl.fa_quant_layer = False
+        self.impl.enable_kv_nz = False
+
+        projected = torch.empty((17, num_heads * self.impl.v_head_dim))
+        with (
+            patch(
+                "vllm_ascend.attention.mla_v1._EXTRA_CTX",
+                SimpleNamespace(capturing=True, is_draft_model=False),
+            ),
+            patch(
+                "vllm_ascend.attention.mla_v1.weak_ref_tensors",
+                side_effect=lambda value: value,
+            ),
+            patch(
+                "torch_npu.npu.current_stream",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                self.impl,
+                "_v_up_proj_batch_major",
+                return_value=projected,
+            ),
+        ):
+            result = self.impl._forward_decode(
+                q_nope,
+                q_pe,
+                k_nope,
+                k_pe,
+                block_size,
+                metadata,
+            )
+
+        self.assertIs(result, projected)
+        self.assertEqual(len(graph_params.attn_params[17]), 1)
+        self.assertEqual(graph_params.attn_params[17][0][20], (1, 17))
+        self.assertEqual(graph_params.handles[17], [handle])
+        self.assertEqual(graph_params.workspaces[17], workspace)
+        mock_update_workspaces.assert_called_once_with(17, workspace)
+        mock_graph_begin.assert_called_once()
+        mock_graph_end.assert_called_once()
+        mock_event.return_value.wait.assert_called_once()
+        mock_event.return_value.reset.assert_called_once()
+        mock_fia_out.assert_called_once()
+
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_update_graph_params_empty_layers(self, mock_get_forward_context):
         # if num_layers == 0

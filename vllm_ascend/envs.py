@@ -104,6 +104,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Force the deterministic greedy root-to-leaf chain into every packed
+    # DSpark tree. Default False; valid values are 0 (disabled) and 1 (enabled).
+    "VLLM_ASCEND_TREE_KEEP_GREEDY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_TREE_KEEP_GREEDY", "0"))
+    ),
 }
 
 # end-env-vars-definition

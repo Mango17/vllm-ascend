@@ -118,9 +118,21 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
+    tree_visibility: torch.Tensor | None = None,
+    slot_positions: torch.Tensor | None = None,
+    is_prefilling: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
+    # Draft-model metadata builders do not currently pass num_input_tokens.
+    # Infer it from the already padded token count so TND FULL-graph metadata
+    # covers the same query rows as the captured dummy batch.
+    if num_input_tokens <= 0:
+        num_input_tokens = num_tokens
+    query_start_loc_cpu = align_padded_query_start_loc(
+        query_start_loc_cpu,
+        num_input_tokens,
+    )
 
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
@@ -161,6 +173,10 @@ def build_attn_metadata(
             num_input_tokens=num_input_tokens,
             max_seq_len=max_seq_len,
             causal=group_causal,
+            tree_visibility=tree_visibility,
+            slot_positions=slot_positions,
+            for_cudagraph_capture=for_cudagraph_capture,
+            is_prefilling=is_prefilling,
             **common_attn_metadata_extra_kwargs,
         )
 
@@ -185,6 +201,21 @@ def build_attn_metadata(
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata
+
+
+def align_padded_query_start_loc(
+    query_start_loc_cpu: torch.Tensor,
+    num_input_tokens: int,
+) -> torch.Tensor:
+    """Make the final padded request cover the remaining FIA TND query rows."""
+    if (
+        query_start_loc_cpu.numel() == 0
+        or int(query_start_loc_cpu[-1]) >= num_input_tokens
+    ):
+        return query_start_loc_cpu
+    query_start_loc_cpu = query_start_loc_cpu.clone()
+    query_start_loc_cpu[-1] = num_input_tokens
+    return query_start_loc_cpu
 
 
 def build_attn_state(

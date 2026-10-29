@@ -16,6 +16,7 @@
 import torch
 
 from vllm_ascend.attention.utils import filter_chunked_req_indices
+from vllm_ascend.worker.v2.attn_utils import align_padded_query_start_loc
 
 
 def test_filter_chunked_req_indices_empty_mask() -> None:
@@ -34,3 +35,26 @@ def test_filter_chunked_req_indices_mixed_mask() -> None:
     )
 
     torch.testing.assert_close(indices, torch.tensor([0, 1, 3, 4, 5]))
+
+
+def test_align_padded_query_start_loc_covers_packed_queries() -> None:
+    query_start_loc = torch.tensor([0, 7, 14, 21, 21])
+
+    aligned = align_padded_query_start_loc(query_start_loc, 28)
+
+    torch.testing.assert_close(
+        aligned,
+        torch.tensor([0, 7, 14, 21, 28]),
+    )
+    torch.testing.assert_close(
+        query_start_loc,
+        torch.tensor([0, 7, 14, 21, 21]),
+    )
+
+
+def test_align_padded_query_start_loc_is_noop_when_complete() -> None:
+    query_start_loc = torch.tensor([0, 7, 14, 21, 28])
+
+    aligned = align_padded_query_start_loc(query_start_loc, 28)
+
+    assert aligned is query_start_loc

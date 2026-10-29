@@ -18,6 +18,7 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -87,6 +88,45 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         # so we need to set graph params before capture full graph.
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+
+    def _init_candidates(self) -> None:
+        super()._init_candidates()
+        self._reshape_tree_verify_full_descs()
+
+    def _reshape_tree_verify_full_descs(self) -> None:
+        """Capture tree verification as uniform ``1 + budget`` query batches."""
+        from vllm_ascend.worker.v2.spec_decode import (
+            dflash_tree_spec_enabled,
+            tree_target_query_len,
+        )
+
+        if not dflash_tree_spec_enabled(self.vllm_config):
+            return
+        query_len = tree_target_query_len(self.vllm_config)
+        if query_len is None or query_len <= 1:
+            return
+        full_descs = self._capture_descs.get(CUDAGraphMode.FULL)
+        if not full_descs:
+            return
+
+        remap: dict[int, BatchExecutionDescriptor] = {}
+        reshaped: list[BatchExecutionDescriptor] = []
+        for orig in full_descs:
+            desc = orig
+            if orig.num_tokens > 0 and orig.num_tokens % query_len == 0:
+                desc = replace(
+                    orig,
+                    num_reqs=orig.num_tokens // query_len,
+                    max_query_len=query_len,
+                    uniform_token_count=query_len,
+                )
+            remap[id(orig)] = desc
+            reshaped.append(desc)
+        self._capture_descs[CUDAGraphMode.FULL] = reshaped
+        for key, descriptors in self._candidates.items():
+            self._candidates[key] = [
+                remap.get(id(descriptor), descriptor) for descriptor in descriptors
+            ]
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
@@ -190,6 +230,17 @@ class ModelWithContext(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor):
         return self.original_model.markov_bias(markov_embed)
+
+    def markov_init_state(self, batch_size: int):
+        return self.original_model.markov_init_state(batch_size)
+
+    def markov_step(
+        self,
+        state: torch.Tensor,
+        token_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ):
+        return self.original_model.markov_step(state, token_ids, hidden_states)
 
     def map_draft_to_target(self, draft_ids: torch.Tensor):
         return self.original_model.map_draft_to_target(draft_ids)

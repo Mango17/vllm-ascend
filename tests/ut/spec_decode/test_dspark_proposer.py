@@ -176,6 +176,62 @@ class _DSparkProposerTestBase:
 # fmt: on
 
 
+def test_dspark_sample_propagates_rnn_state_and_hidden_states():
+    class StatefulMarkovModel:
+        def __init__(self):
+            self.state_inputs = []
+            self.hidden_inputs = []
+            self.step_count = 0
+
+        def markov_init_state(self, batch_size):
+            return torch.zeros((batch_size, 1), dtype=torch.float32)
+
+        def markov_step(self, state, token_ids, hidden_states):
+            self.state_inputs.append(state.clone())
+            self.hidden_inputs.append(hidden_states.clone())
+            self.step_count += 1
+            bias = torch.zeros((token_ids.shape[0], 4), dtype=torch.float32)
+            bias[:, self.step_count - 1] = 10
+            return state + 1, bias
+
+    num_blocks = 2
+    num_speculative_tokens = 3
+    proposer = object.__new__(AscendSpecDecodeBaseProposer)
+    proposer.num_speculative_tokens = num_speculative_tokens
+    proposer.model = StatefulMarkovModel()
+
+    logits = torch.zeros(
+        (num_blocks, num_speculative_tokens, 4), dtype=torch.float32
+    )
+    draft_token_ids = torch.zeros(
+        (num_blocks, num_speculative_tokens + 1), dtype=torch.int64
+    )
+    sample_hidden_states = torch.arange(
+        num_blocks * num_speculative_tokens * 2,
+        dtype=torch.float32,
+    ).view(num_blocks * num_speculative_tokens, 2)
+
+    AscendSpecDecodeBaseProposer._dspark_sample(
+        proposer,
+        logits,
+        draft_token_ids,
+        sample_hidden_states,
+    )
+
+    assert proposer.model.step_count == num_speculative_tokens
+    for step, state in enumerate(proposer.model.state_inputs):
+        assert torch.all(state == step)
+    for step, hidden in enumerate(proposer.model.hidden_inputs):
+        expected = sample_hidden_states.view(
+            num_blocks, num_speculative_tokens, -1
+        )[:, step]
+        assert torch.equal(hidden, expected)
+    assert torch.equal(
+        draft_token_ids[:, 1:],
+        torch.arange(num_speculative_tokens).expand(num_blocks, -1),
+    )
+
+
 class TestDSparkPositionsFullUnderMultiDp(_DSparkProposerTestBase):
     """Guard: under multi-DP the dspark draft proposer must hand DSA attention a
     full-length positions buffer so ``positions[:num_input_tokens]`` never reads

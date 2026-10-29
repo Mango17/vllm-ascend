@@ -69,14 +69,40 @@ def fusion_pass_compile(
 
 
 def _compute_decode_cudagraph_batch_sizes(vllm_config: VllmConfig) -> list[int]:
-    num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
-    uniform_decode_query_len = num_spec_tokens + 1
+    speculative_config = vllm_config.speculative_config
+    if speculative_config:
+        from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+
+        if dflash_tree_spec_enabled(vllm_config):
+            from vllm_ascend.worker.v2.spec_decode import tree_target_query_len
+
+            qlen = tree_target_query_len(vllm_config)
+            uniform_decode_query_len = (
+                qlen if qlen is not None else 1 + speculative_config.num_speculative_tokens
+            )
+        else:
+            uniform_decode_query_len = 1 + speculative_config.num_speculative_tokens
+    else:
+        uniform_decode_query_len = 1
     max_num_tokens = vllm_config.scheduler_config.max_num_seqs * uniform_decode_query_len
-    return [
+    configured_sizes = vllm_config.compilation_config.cudagraph_capture_sizes
+    batch_sizes = [
         x
-        for x in vllm_config.compilation_config.cudagraph_capture_sizes
+        for x in configured_sizes
         if max_num_tokens >= x >= uniform_decode_query_len
     ]
+    # The configured buckets may all be larger than one uniform decode batch
+    # (for example 21+ tokens with a 17-token tree query). Keep the base bucket
+    # so a single request does not silently fall back to eager execution.
+    if (
+        configured_sizes
+        and max_num_tokens >= uniform_decode_query_len
+        and uniform_decode_query_len
+        <= vllm_config.compilation_config.max_cudagraph_capture_size
+        and uniform_decode_query_len not in batch_sizes
+    ):
+        batch_sizes.append(uniform_decode_query_len)
+    return sorted(set(batch_sizes))
 
 
 def _configure_backend(

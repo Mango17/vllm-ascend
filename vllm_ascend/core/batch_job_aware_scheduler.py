@@ -683,3 +683,10 @@ class BatchJobAwareAsyncScheduler(AsyncScheduler, BatchJobAwareScheduler):
     """
 
     pass
+
+
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
+
+_patch_tree_verify_width(BatchJobAwareScheduler)
