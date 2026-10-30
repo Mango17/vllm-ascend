@@ -164,6 +164,13 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.decode_query_len)
         set_mc2_mask(vllm_config, self.device)
 
+    def _get_decode_query_len(self) -> int:
+        if dflash_tree_spec_enabled(self.vllm_config):
+            qlen = tree_target_query_len(self.vllm_config)
+            if qlen is not None:
+                return qlen
+        return super()._get_decode_query_len()
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
             super().initialize_kv_cache(kv_cache_config)

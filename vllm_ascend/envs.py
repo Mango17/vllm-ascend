@@ -114,6 +114,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_TREE_DEBUG": lambda: bool(
         int(os.getenv("VLLM_ASCEND_TREE_DEBUG", "0"))
     ),
+    "VLLM_ASCEND_TREE_KV_COMPACT_GRAPH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_TREE_KV_COMPACT_GRAPH", "0"))
+    ),
 }
 
 # end-env-vars-definition

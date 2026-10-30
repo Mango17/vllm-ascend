@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from vllm.config.compilation import CUDAGraphMode
 
+import vllm_ascend.worker.v2.model_runner as model_runner_module
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
@@ -42,3 +43,22 @@ def test_fullgraph_runtime_preserves_configured_batch_routing(
 
     assert num_reqs_padded == expected_num_reqs_padded
     np.testing.assert_array_equal(result, expected_query_start_loc)
+
+
+def test_tree_decode_query_len_uses_tree_width(monkeypatch):
+    runner = cast(
+        NPUModelRunner,
+        SimpleNamespace(vllm_config=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "dflash_tree_spec_enabled",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "tree_target_query_len",
+        lambda _config: 33,
+    )
+
+    assert NPUModelRunner._get_decode_query_len(runner) == 33

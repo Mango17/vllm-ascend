@@ -177,6 +177,46 @@ class TestNPUPlatform(TestBase):
         self.assertIsNone(vllm_config.compilation_config.max_cudagraph_capture_size)
         self.assertEqual(vllm_config.compilation_config.cudagraph_capture_sizes, [1, 2, 4])
 
+    @patch(
+        "vllm_ascend.worker.v2.spec_decode.dflash_tree_spec_enabled",
+        return_value=True,
+    )
+    @patch(
+        "vllm_ascend.worker.v2.spec_decode.dsv4_dspark_draft",
+        return_value=False,
+    )
+    def test_apply_config_platform_defaults_adds_tree_max_bucket(
+        self, _mock_dsv4_draft, _mock_tree_enabled
+    ):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.scheduler_config.max_num_seqs = 16
+        vllm_config.scheduler_config.max_num_batched_tokens = 8192
+        vllm_config.speculative_config = MagicMock(num_speculative_tokens=7)
+        vllm_config.additional_config = {
+            "tree_spec_config": {
+                "enabled": True,
+                "method": "beam",
+                "budget": 32,
+                "topk": 4,
+            }
+        }
+        vllm_config.compilation_config.cudagraph_mode = (
+            CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        vllm_config.compilation_config.max_cudagraph_capture_size = None
+        vllm_config.compilation_config.cudagraph_capture_sizes = [33, 128, 512]
+
+        self.platform.apply_config_platform_defaults(vllm_config)
+
+        self.assertEqual(
+            vllm_config.compilation_config.cudagraph_capture_sizes,
+            [33, 128, 512, 528],
+        )
+        self.assertEqual(
+            vllm_config.compilation_config.max_cudagraph_capture_size,
+            528,
+        )
+
     def test_apply_config_platform_defaults_skips_when_scheduler_max_num_seqs_is_missing(self):
         vllm_config = TestNPUPlatform.mock_vllm_config()
         vllm_config.compilation_config.max_cudagraph_capture_size = None

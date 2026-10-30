@@ -283,6 +283,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             target_arch,
             draft_arch,
         )
+        logger.info(
+            "Tree context packing implementation: unique-scratch-v3 "
+            "(fixed-shape, unique context slots)"
+        )
         from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
         from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
             use_tree_triton,
@@ -517,7 +521,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             prefix_len=self._domino_prefix_len,
             params=self.params,
         )
-        markov_head = getattr(getattr(model, "model", model), "markov_head", None)
+        markov_head = getattr(model, "markov_head", None)
+        if markov_head is None:
+            markov_head = getattr(getattr(model, "model", None), "markov_head", None)
         markov_type = getattr(markov_head, "head_type", None)
         draft_hf = self.draft_model_config.hf_config
         tree_training_anchors = getattr(draft_hf, "tree_loss_num_anchors", None)
@@ -850,8 +856,11 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                                 path_node_ids,
                                 linearize_positions=input_batch.positions,
                             )
-                self._log_rejected_context_slots(
-                    input_batch, num_sampled, num_rejected
+                self._prepare_rejected_context_positions(
+                    input_batch.positions,
+                    input_batch.query_start_loc,
+                    num_sampled,
+                    num_rejected,
                 )
             self._tree_finalized = False
             # DSV4's HC inputs need width alignment. Qwen's combine_hidden_states
@@ -947,42 +956,59 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         finally:
             self._dsv4_chunk_prefix_len = None
 
-    def _log_rejected_context_slots(
+    def _prepare_rejected_context_positions(
         self,
-        input_batch,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
     ) -> None:
-        """Report packed-tree rows that must not write draft context KV."""
-        if not tree_debug_enabled():
-            return
-        self._debug_context_calls += 1
-        if not should_log_tree_debug(self._debug_context_calls):
-            return
+        """Move rejected packed-tree rows onto unique unused scratch slots.
 
-        num_reqs = input_batch.num_reqs
-        qsl = input_batch.query_start_loc[: num_reqs + 1].detach().cpu().tolist()
-        positions = input_batch.positions.detach().cpu().tolist()
+        DFlash precomputes context KV for every target query row. The accepted
+        root+path occupies ``P..P+D``; exactly ``budget-D`` packed-tree slots
+        remain. Reassign rejected rows to those unique slots
+        ``P+D+1..P+budget`` so they cannot overwrite accepted KV. Draft query
+        rows overwrite the leading scratch slots and the remaining scratch
+        positions are outside the draft attention sequence length.
+        """
+        num_reqs = num_sampled.shape[0]
+        qsl = query_start_loc[: num_reqs + 1].detach().cpu().tolist()
         sampled = num_sampled[:num_reqs].detach().cpu().tolist()
         rejected = num_rejected[:num_reqs].detach().cpu().tolist()
-        collision_positions = []
         for req in range(num_reqs):
             start, end = int(qsl[req]), int(qsl[req + 1])
+            if not (0 <= start <= end <= positions.numel()):
+                raise RuntimeError(
+                    "Rejected context rows exceed the target query buffer"
+                )
             valid_end = start + int(sampled[req])
-            valid = set(positions[start:valid_end])
-            collision_positions.append(
-                sum(int(position) in valid for position in positions[valid_end:end])
+            if valid_end <= start or valid_end >= end:
+                continue
+            destination = torch.arange(
+                valid_end, end, dtype=torch.long, device=positions.device
             )
-        log_tree_debug(
-            "[TREEDSPARK][context-kv] call=%d reqs=%d sampled=%s rejected=%s "
-            "collision_positions=%s first_positions=%s",
-            self._debug_context_calls,
-            num_reqs,
-            sampled,
-            rejected,
-            collision_positions,
-            positions[: min(int(qsl[-1]), 12)],
-        )
+            offset = torch.arange(
+                1,
+                destination.numel() + 1,
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            positions[destination] = positions[valid_end - 1] + offset
+
+        if tree_debug_enabled():
+            self._debug_context_calls += 1
+            if should_log_tree_debug(self._debug_context_calls):
+                log_tree_debug(
+                    "[TREEDSPARK][context-kv] call=%d reqs=%d sampled=%s "
+                    "rejected=%s rejected_rows_scratch=True "
+                    "first_positions=%s",
+                    self._debug_context_calls,
+                    num_reqs,
+                    sampled,
+                    rejected,
+                    positions[: min(int(qsl[-1]), 12)].detach().cpu().tolist(),
+                )
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)

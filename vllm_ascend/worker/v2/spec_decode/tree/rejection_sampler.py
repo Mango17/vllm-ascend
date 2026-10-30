@@ -256,6 +256,23 @@ class TreeRejectionSampler(RejectionSampler):
             (r, d, v), dtype=torch.float32, device=device
         )
 
+    def _validate_tree_greedy_penalties(self, input_batch: InputBatch) -> None:
+        """Reject token-history penalties that are not tree-causal."""
+        idx_mapping_np = input_batch.idx_mapping_np
+        penalties = self.sampler.penalties_state
+        active = (
+            np.any(penalties.repetition_penalty.np[idx_mapping_np] != 1.0)
+            or np.any(penalties.frequency_penalty.np[idx_mapping_np] != 0.0)
+            or np.any(penalties.presence_penalty.np[idx_mapping_np] != 0.0)
+        )
+        if active:
+            raise ValueError(
+                "TreeDSpark greedy verification does not support "
+                "repetition/frequency/presence penalties on packed tree "
+                "logits; set repetition_penalty=1.0, frequency_penalty=0.0 "
+                "and presence_penalty=0.0"
+            )
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -285,6 +302,7 @@ class TreeRejectionSampler(RejectionSampler):
         num_reqs = input_batch.num_reqs
         node_dim = tree.tokens.shape[1] + 1
         self._ensure_bufs(num_reqs, node_dim, logits.shape[-1])
+        self._validate_tree_greedy_penalties(input_batch)
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         positions = input_batch.positions[input_batch.logits_indices]
         processed_logits = self.sampler.apply_sampling_params(
@@ -294,6 +312,10 @@ class TreeRejectionSampler(RejectionSampler):
             positions,
             draft_sampled,
             input_batch.expanded_local_pos,
+            # temperature=0 greedy verification only needs the argmax.
+            # top-k/top-p cannot remove the argmax and their packed-tree
+            # processing is unnecessary on the device.
+            skip_top_k_top_p=True,
         )
         target_logits = _pack_tree_target_logits(
             processed_logits,

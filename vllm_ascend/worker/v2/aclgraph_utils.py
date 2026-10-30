@@ -66,6 +66,16 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         model_runner: Any,
         lora_capture_cases: list[int] | None = None,
     ):
+        from vllm_ascend.worker.v2.spec_decode import tree_target_query_len
+
+        tree_query_len = tree_target_query_len(vllm_config)
+        self.tree_query_len = tree_query_len
+        if tree_query_len is not None and decode_query_len != tree_query_len:
+            raise ValueError(
+                "TreeDSpark graph query width does not match the scheduler: "
+                f"decode_query_len={decode_query_len}, "
+                f"tree_query_len={tree_query_len}."
+            )
         super().__init__(
             vllm_config,
             device,
@@ -88,6 +98,47 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         # so we need to set graph params before capture full graph.
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
+        if tree_query_len is not None:
+            required_tokens = min(
+                self.max_num_reqs * tree_query_len,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+            )
+            if required_tokens > self.compilation_config.max_cudagraph_capture_size:
+                logger.warning_once(
+                    "TreeDSpark graph capture is too small for the maximum "
+                    "batch: required_tokens=%d, max_capture_tokens=%d. "
+                    "Larger decode batches will fall back to eager.",
+                    required_tokens,
+                    self.compilation_config.max_cudagraph_capture_size,
+                )
+
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+    ) -> BatchExecutionDescriptor:
+        desc = super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+        )
+        if (
+            desc.cg_mode == CUDAGraphMode.NONE
+            and self.tree_query_len is not None
+            and uniform_token_count == self.tree_query_len
+        ):
+            logger.warning_once(
+                "TreeDSpark FULL graph miss: num_reqs=%d, num_tokens=%d, "
+                "query_len=%d, capture_sizes=%s.",
+                num_reqs,
+                num_tokens,
+                self.tree_query_len,
+                self.capture_sizes,
+            )
+        return desc
 
     def _init_candidates(self) -> None:
         super()._init_candidates()
@@ -117,7 +168,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 desc = replace(
                     orig,
                     num_reqs=orig.num_tokens // query_len,
-                    max_query_len=query_len,
                     uniform_token_count=query_len,
                 )
             remap[id(orig)] = desc

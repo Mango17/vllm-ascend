@@ -14,7 +14,9 @@ def _reference_markov_step(
     if draft_model is None:
         return depth_logits.unsqueeze(0).expand(frontier_tokens.numel(), -1), None
 
-    markov_head = getattr(getattr(draft_model, "model", draft_model), "markov_head", None)
+    markov_head = getattr(draft_model, "markov_head", None)
+    if markov_head is None:
+        markov_head = getattr(getattr(draft_model, "model", None), "markov_head", None)
     head_type = getattr(markov_head, "head_type", "vanilla")
     if head_type == "vanilla":
         embeddings = draft_model.markov_embed(frontier_tokens)

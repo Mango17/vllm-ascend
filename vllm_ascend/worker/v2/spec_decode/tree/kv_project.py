@@ -1,6 +1,7 @@
 import torch
 from vllm.logger import init_logger
 
+from vllm_ascend import envs
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     iter_unique_kv_cache_tensors,
 )
@@ -97,9 +98,19 @@ class TreeKvCompact:
         self._dst_off = self._depth
         self._debug_compaction_calls = 0
         self._debug_verify_compaction = False
+        logger.info(
+            "Tree KV compact path: %s",
+            "ACLGraph"
+            if envs.VLLM_ASCEND_TREE_KV_COMPACT_GRAPH
+            else "eager",
+        )
 
     def capture(self, sizes: list[int]) -> None:
-        if not sizes or self.runner.model_config.enforce_eager:
+        if (
+            not sizes
+            or self.runner.model_config.enforce_eager
+            or not envs.VLLM_ASCEND_TREE_KV_COMPACT_GRAPH
+        ):
             return
         if not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
             return
@@ -156,7 +167,10 @@ class TreeKvCompact:
                 )
         else:
             self._debug_verify_compaction = False
-        if self.runner.model_config.enforce_eager:
+        if (
+            self.runner.model_config.enforce_eager
+            or not envs.VLLM_ASCEND_TREE_KV_COMPACT_GRAPH
+        ):
             self._compact_eager(num_reqs)
             return
         graph = self._graphs.get(num_reqs)
@@ -201,7 +215,7 @@ class TreeKvCompact:
             if bool(((src_col >= table.shape[1]) | (dst_col >= table.shape[1])).any().item()):
                 raise RuntimeError("Accepted KV page exceeds block-table capacity")
             src_block, dst_block = table[req, src_col], table[req, dst_col]
-            if bool(((src_block <= 0) | (dst_block <= 0)).any().item()):
+            if bool(((src_block < 0) | (dst_block < 0)).any().item()):
                 raise RuntimeError("Accepted KV path references an unallocated/null page")
             src_off, dst_off = src % block_size, dst % block_size
             for cache in caches:

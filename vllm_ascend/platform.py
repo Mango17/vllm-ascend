@@ -203,6 +203,74 @@ class NPUPlatform(Platform):
         config_deprecated_logging()
 
     @classmethod
+    def _get_tree_decode_query_len(cls, vllm_config: VllmConfig) -> int | None:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None or not speculative_config.num_speculative_tokens:
+            return None
+
+        from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+
+        if not dflash_tree_spec_enabled(vllm_config):
+            return None
+
+        tree_spec = (
+            getattr(vllm_config, "additional_config", None) or {}
+        ).get("tree_spec_config") or {}
+        topk = int(tree_spec.get("topk") or 1)
+        spec_n = int(speculative_config.num_speculative_tokens)
+        if topk <= 1:
+            from vllm_ascend.worker.v2.spec_decode import dsv4_dspark_draft
+
+            if dsv4_dspark_draft(vllm_config, speculative_config):
+                return 1 + spec_n
+        return 1 + int(tree_spec.get("budget") or spec_n)
+
+    @classmethod
+    def _ensure_tree_cudagraph_headroom(cls, vllm_config: VllmConfig) -> None:
+        from vllm.config.compilation import CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        sizes = compilation_config.cudagraph_capture_sizes
+        if (
+            not sizes
+            or compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        ):
+            return
+
+        query_len = cls._get_tree_decode_query_len(vllm_config)
+        max_num_seqs = getattr(vllm_config.scheduler_config, "max_num_seqs", None)
+        max_num_tokens = getattr(
+            vllm_config.scheduler_config, "max_num_batched_tokens", None
+        )
+        if query_len is None or max_num_seqs is None or max_num_tokens is None:
+            return
+
+        required_tokens = min(int(max_num_seqs) * query_len, int(max_num_tokens))
+        if max(sizes) >= required_tokens:
+            return
+        explicit_max = compilation_config.max_cudagraph_capture_size
+        if explicit_max is not None and explicit_max < required_tokens:
+            logger.warning_once(
+                "TreeDSpark needs %d capture tokens for max_num_seqs=%d, "
+                "but max_cudagraph_capture_size=%d. Larger decode batches "
+                "will fall back to eager.",
+                required_tokens,
+                max_num_seqs,
+                explicit_max,
+            )
+            return
+
+        updated_sizes = sorted(set(sizes) | {required_tokens})
+        compilation_config.cudagraph_capture_sizes = updated_sizes
+        compilation_config.max_cudagraph_capture_size = required_tokens
+        logger.info_once(
+            "Added TreeDSpark capture bucket %d for %d requests at query_len=%d.",
+            required_tokens,
+            max_num_seqs,
+            query_len,
+        )
+
+    @classmethod
     def _get_default_max_cudagraph_capture_size(cls, vllm_config: VllmConfig) -> int | None:
         """Mirror the default-max branch in vLLM's `_set_cudagraph_sizes()`.
 
@@ -215,7 +283,8 @@ class NPUPlatform(Platform):
         size-list generation, token-cap clipping, SP filtering, and later
         post-processing. The only intentional difference from upstream is removing
         the CUDA-oriented trailing `* 2`: Ascend wants the default capture upper
-        bound to track `max_num_seqs * decode_query_len`, capped at 512.
+        bound to track `max_num_seqs * decode_query_len`. Non-tree modes keep
+        the 512-token cap; tree verification may need a larger final bucket.
 
         Returning `None` means the platform should not inject a default. This
         covers the cases where the user has already provided either
@@ -232,32 +301,13 @@ class NPUPlatform(Platform):
         if max_num_seqs is None:
             return None
 
-        decode_query_len = 1
+        decode_query_len = cls._get_tree_decode_query_len(vllm_config)
+        if decode_query_len is not None:
+            return max_num_seqs * decode_query_len
+
         speculative_config = getattr(vllm_config, "speculative_config", None)
         if speculative_config and speculative_config.num_speculative_tokens:
-            from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
-
-            if dflash_tree_spec_enabled(vllm_config):
-                from vllm_ascend.worker.v2.spec_decode import (
-                    dsv4_dspark_draft,
-                )
-
-                if dsv4_dspark_draft(vllm_config):
-                    tree_cfg = getattr(vllm_config, "additional_config", None) or {}
-                    tree_spec = tree_cfg.get("tree_spec_config") or {}
-                    spec_n = speculative_config.num_speculative_tokens
-                    topk = int(tree_spec.get("topk") or 1)
-                    if topk <= 1:
-                        decode_query_len = 1 + spec_n
-                    else:
-                        decode_query_len = 1 + int(tree_spec.get("budget") or spec_n)
-                else:
-                    # apply_config_platform_defaults runs before init_ascend_config.
-                    tree_cfg = getattr(vllm_config, "additional_config", None) or {}
-                    decode_query_len = 1 + (tree_cfg.get("tree_spec_config") or {})["budget"]
-            else:
-                decode_query_len = 1 + speculative_config.num_speculative_tokens
-
+            decode_query_len = 1 + speculative_config.num_speculative_tokens
         return min(max_num_seqs * decode_query_len, 512)
 
     @classmethod
@@ -279,6 +329,7 @@ class NPUPlatform(Platform):
         default_max_cg_capture_size = cls._get_default_max_cudagraph_capture_size(vllm_config)
         if default_max_cg_capture_size is not None:
             vllm_config.compilation_config.max_cudagraph_capture_size = default_max_cg_capture_size
+        cls._ensure_tree_cudagraph_headroom(vllm_config)
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
